@@ -24,13 +24,17 @@
 from datetime import datetime
 import logging
 import os
-import re
-from argparse import ArgumentParser
+import sys
+# import re
+from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 
 from dateutil.parser import parse as dt_parse
 
 from idsse.common.utils import exec_cmd, to_compact, to_iso
 from idsse.common.path_builder import PathBuilder
+
+from src.ThreadTimer import ThreadTimer
+from src.download_utils import aws_cp, aws_du, get_random_issue_and_valid
 
 logger = logging.getLogger(__name__)
 
@@ -139,36 +143,9 @@ PRODUCTS = {
                 'lengthOfTimeRange': 6,
             },
         },
+        'regions': ['CO', 'HI', 'PR', 'GU', 'AK']
     },
 }
-
-
-def aws_cp(path: str, dest: str, byte_range: tuple[int] | None = None) -> bool:
-    """Execute a 'cp' on an AWS s3 bucket. Returns True if copy successful.
-    Based on function of same name from DAS.
-
-    Args:
-        path (str): url to S3 object to copy
-        dest (str): local filepath where copy should be saved
-        byte_range (optional, tuple[int] | None): the start byte and (optionally) end byte
-            location within the path file to downloaded. Default is None (copy entire S3 object).
-    """
-    commands = ['s5cmd', '--no-sign-request', 'cp', path, dest]
-    if byte_range:
-        # append argument to s5cmd to request only the specified byte range of s3 object
-        range_start = byte_range[0]
-        range_end = '' if len(byte_range) < 2 else byte_range[1]  # default end is end of file
-
-        # TODO does this truly set Range header?
-        commands += ['--metadata', f'bytes={range_start}-{range_end}']
-
-    try:
-        result = exec_cmd(commands)
-        logger.debug('s5cmd result: %s', result)
-        return True
-    except FileNotFoundError:
-        logger.error('Failed to execute s5cmd cmd. Is it installed?')
-        return False
 
 
 class Reader():
@@ -176,8 +153,8 @@ class Reader():
     def __init__(self, product: str, region: str):
         self._product_name = product
         if self._product_name not in PRODUCTS:
-            raise RuntimeError(
-                f'Product {product} not in supported AWS weather products: {PRODUCTS.keys()}'
+            raise ValueError(
+                f'Product {product} not one of supported AWS weather products: {PRODUCTS.keys()}'
             )
 
         self._product = PRODUCTS[self._product_name]
@@ -189,11 +166,19 @@ class Reader():
         self._region: str
         self.set_region(region)
 
+    def __str__(self):
+        return (f'name={self._product_name}, region={self._region}, '
+                f'PathBuilder={str(self._path_builder)}')
+
     def set_region(self, region: str):
         """Change the geographic region, e.g. HI for HAWAII or CONUS for contiguous US"""
-        self._region = region
-        self._file_ext = f'.{region}{self._product["file_ext"]}'
-        # TODO: does S3 path change?
+        if region not in self._product['regions']:
+            raise ValueError((f'Region {region} not one of the regions for this AWS product: ',
+                              self._product["regions"]))
+
+        self._region = region.lower()
+        self._file_ext = f'.{self._region}{self._product["file_ext"]}'  # update destination file
+        self._path_builder.file_ext = self._file_ext  # update source file ext
 
     def download_field(self,
                        issue_dt: str,
@@ -221,38 +206,62 @@ class Reader():
 
 
         # use info from index file to download on the part of GRIB file that has target field
-        s3_path = self._path_builder.build_path(issue_datetime, valid_datetime)
+        s3_path = self.get_source_path(issue_datetime, valid_datetime)
+
         # generate new filepath for downloaded grib file
-        dest_filepath = self._get_dest_filepath(issue_datetime, valid_datetime, field)
+        dest_filepath = self.get_local_filename(issue_datetime, valid_datetime, field=field)
         dest_path = os.path.join(dest_dir, dest_filepath)
 
         logger.debug('Copying s3 object from %s to %s with range %s', s3_path, dest_path,
                      byte_range)
         return self._download_file(s3_path, dest_path, byte_range)
 
-    def _get_dest_filepath(self,
-                           issue: datetime,
-                           valid: datetime,
-                           field: str | None = None) -> str:
+    def get_local_filename(self,
+                          issue: datetime,
+                          valid: datetime,
+                          region: str | None = None,
+                          field: str | None = None) -> str:
         """Generate destination filepath for local filesystem
 
         Args:
             issue (datetime): the product's issuance datetime
             valid (datetime): the product's valid datetime
+            region (optional, str | None): the region (e.g. CONUS), which will overwrite the
+                existing region set for this Reader if needed.
             field (optional, str | None): weather field, if downloading a specific field.
                 Default is None
 
         Returns:
-            str: A local filepath to use
+            str: A local filepath to use as a cp destination
         """
+        if region and region != self._region:
+            self.set_region(region)  # overwrite Reader's previous region with this specific one
+
         _path = f'{self._product_name}_{to_compact(issue)}_{to_compact(valid)}'
         # append field name, if one was passed
         if field:
             _path += f'_{field}'
         # _path += f'.{self._region}{self._path_builder.file_ext}'
-        _path += f'.{self._region}{self._file_ext}'
+        _path += self._file_ext
 
         return _path
+
+    def get_source_path(self, issue: datetime, valid: datetime, region: str | None = None) -> str:
+        """Generate S3 source filepath for the given product reader to download a file.
+
+        Args:
+            issue (datetime): the product's issuance datetime
+            valid (datetime): the product's valid datetime
+            region (optional, str | None): the region (e.g. CONUS), which will overwrite the
+                existing region set for this Reader if needed.
+
+        Returns:
+            str: An s3 filepath to use as a cp source
+        """
+        if region and region != self._region:
+            self.set_region(region)  # overwrite Reader's previous region with this specific one
+
+        return self._path_builder.build_path(issue, valid)
 
     def _is_line_matching_field(self, index_line: str, field: str):
         """Determine if field from PRODUCT definitions matches a given line of a GRIB index file
@@ -317,14 +326,12 @@ class Reader():
         self._path_builder.file_ext += '.idx'
 
         # build index filepath for S3 location, and destination filepath on local fs
-        dest_path = os.path.join(dest_dir, self._get_dest_filepath(issue, valid))
-        src_path = self._path_builder.build_path(issue, valid)  # TODO: proper building idx path? yes
-        if os.path.exists(dest_path):
-            return dest_path  # reuse local index file, if it exists
+        index_dest_path = os.path.join(dest_dir, self.get_local_filename(issue, valid))
+        index_src_path = self.get_source_path(issue, valid)  # TODO: proper building idx path? yes
 
         try:
-            logger.debug('Downloading index file from %s to %s', src_path, dest_path)
-            index_file_path = self._download_file(src_path, dest_path)
+            logger.debug('Downloading index file from %s to %s', index_src_path, index_dest_path)
+            index_file_path = self._download_file(index_src_path, index_dest_path)
         finally:
             # reset to original file extensions
             self._file_ext = original_config_ext
@@ -341,18 +348,118 @@ class Reader():
         return dest
 
 
+# s5cmd benchmark testing
+def _benchmark_aws_cp(src_path: str,
+                      dest_path: str,
+                      file_size: str | int,
+                      s5_args: tuple[int]) -> str:
+    # make sure local file doesn't already exist. might be unneeded as cp would overwrite
+    if os.path.exists(dest_path):
+        exec_cmd(['rm', dest_path])
+        logger.debug('Deleted local file before running next test: %s', dest_path)
+
+    concurrency, chunk_size = s5_args
+    logger.info('Downloading file %s with concurrency: %s, part_size: %s',
+                src_path, concurrency, chunk_size)
+
+    # run aws_cp with custom concurrency and part_size, timing result
+    timer = ThreadTimer((f'downloaded {file_size}B, concurrency: {concurrency}, '
+                         f'part_size: {chunk_size} MB'))
+    aws_cp(src_path, dest_path, concurrency=concurrency, part_size=chunk_size,
+            disable_cache=True)
+    timer.stop()
+    logger.warning('Completed: %s', timer.get_result())
+
+    return dest_path
+
+
+def _build_file_paths(reader: Reader,
+                      dest_dir: str,
+                      issue: datetime,
+                      valid: datetime,
+                      humanize = True) -> tuple[str, str, str | int]:
+    """Based on a given issue and valid datetime, generate source and destination paths,
+    and get the size of the file in S3.
+
+    Returns:
+        tuple[str, str, str | int]: source path (s3://...), destination path (/local/file/path),
+            and human-readable file size (either string like 2.1MB, or byte count as int)
+    """
+    dest_path = os.path.join(dest_dir, reader.get_local_filename(issue, valid))
+    src_path = reader.get_source_path(issue, valid)
+    # lookup size of src file in S3 for reporting purposes (don't count the index file)
+    file_size = aws_du(src_path, exclude='*.idx', humanize=humanize)
+
+    return src_path, dest_path, file_size
+
+
+def _delete_files(filepaths: list[str]):
+    logger.info('Now deleting %s downloaded files', len(filepaths))
+    for file in filepaths:
+        exec_cmd(['rm', file])
+        logger.debug('Deleted %s', file)
+
+
+def test_concurrency(_args: Namespace):
+    """Quick test to evaluate how much speed we get from s5cmd concurrency for large GRIB files"""
+    reader = Reader(_args.product, _args.region)
+    logger.debug('Created Reader: %s', reader)
+    dest_dir = _args.dest
+
+    # if issue_dt and valid_dt not provided, these variables will be dynamic on every test run
+    src_path: str | None = None
+    dest_path: str | None = None
+    file_size: str | None = None
+    # random issue and valid datetimes will be selected if not pass in command line args
+    specific_issue: datetime | None = None
+    specific_valid: datetime | None = None
+
+    if (_args.issue_dt and _args.valid_dt):
+        # download a specific issue_dt and valid_dt GRIB file
+        specific_issue = dt_parse(_args.issue_dt)
+        specific_valid = dt_parse(_args.valid_dt)
+
+        src_path, dest_path, file_size = _build_file_paths(reader, dest_dir, specific_issue,
+                                                           specific_valid)
+
+    chunk_sizes = [1, 5, 10, 50]  # chunk size in MB
+    concurrency_threads = [5, 10, 20, 50, 200]
+
+    files_created: list[str] = []  # local paths of any generated files, so we can cleanup later
+
+    logger.info('Running s3 download for file concurrency threads: %s, chunk size %s MB',
+                concurrency_threads, chunk_sizes)
+    for concurrency in concurrency_threads:
+        for chunk_size in chunk_sizes:
+            if not specific_issue or not specific_valid:
+                # pick a random issue_dt in the past few months, and a valid time +6 hours
+                issue, valid = get_random_issue_and_valid()
+                logger.debug('Generated random issue %s and valid %s', to_iso(issue), to_iso(valid))
+                src_path, dest_path, file_size = (
+                    _build_file_paths(reader, dest_dir, issue, valid)
+                )
+
+            file_created = _benchmark_aws_cp(src_path, dest_path, file_size,
+                                             s5_args=(concurrency, chunk_size))
+            files_created.append(file_created)
+
+    # if requested, clean up copies of all files downloaded by this script
+    if _args.cleanup and len(files_created) > 0:
+        _delete_files(files_created)
+
+
 def main():
     """Driver function"""
     parser = ArgumentParser()
     parser.add_argument('--product',
                         dest='product',
                         default='NBM',
+                        choices=PRODUCTS.keys(),
                         help='Target weather product in AWS, one of: [NBM]. Default: NBM')
     parser.add_argument('--region',
                         dest='region',
-                        default='CONUS',
-                        choices=PRODUCTS.keys(),
-                        help='Geographic region, such as CONUS, AK, or HI. Default: CONUS')
+                        default='CO',
+                        help='Geographic region acronym, such as CO, AK, HI. Default: CO (CONUS)')
     parser.add_argument('--issue_dt',
                         dest='issue_dt',
                         help=('The issuance datetime of this product to read, in ISO-8601 format. '
@@ -363,34 +470,51 @@ def main():
                               'E.g. 2020-01-01T12:00:00Z'))
     parser.add_argument('--dest',
                         dest='dest',
-                        default='.',
+                        default=os.path.dirname(__file__),
                         help='Filepath destination (directory) where file should be downloaded')
     parser.add_argument('--fields',
                         # TODO: how do make this accept multiple fields?
+                        default=None,
                         dest='fields',
                         help='List of human-readable weather fields to download from S3')
-
+    parser.add_argument('--loglevel', '--log_level',
+                        dest='loglevel',
+                        default='INFO',
+                        help='Set the logging level, e.g. DEBUG. Default is INFO')
+    parser.add_argument('--cleanup',
+                        dest='cleanup',
+                        action=BooleanOptionalAction,
+                        help='Pass this flag to have script delete all downloaded files when done')
     args = parser.parse_args()
+
+    format_str = ('%(asctime)-15s %(levelname)-8s %(module)s::'
+                  '%(funcName)s(line %(lineno)d) %(message)s')
+    logging.basicConfig(
+        level=args.loglevel,
+        format=format_str,
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
     logger.info('Running with args: %s', args)
 
-    reader = Reader(args.product, args.region)
+    test_concurrency(args)
 
-    target_fields = args.fields
-    logger.info('Created reader %s, now using to fetch fields %s', reader, args.fields)
-    issue_dt = args.issue_dt
-    valid_dt = args.valid_dt
-    dest_dir = args.dest
+    # reader = Reader(args.product, args.region)
 
-    for field in target_fields:
-        dest_file = reader.download_field(issue_dt, valid_dt, field, dest_dir)
-        if dest_file:
-            logger.info('Downloaded file: %s', dest_file)
-        else:
-            logger.error('Failed to download file for field %s', field)
+    # target_fields = args.fields
+    # logger.info('Created reader %s, now using to fetch fields %s', reader, args.fields)
+    # issue_dt = args.issue_dt
+    # valid_dt = args.valid_dt
+    # dest_dir = args.dest
+
+    # for field in target_fields:
+    #     dest_file = reader.download_field(issue_dt, valid_dt, field, dest_dir)
+    #     if dest_file:
+    #         logger.info('Downloaded file: %s', dest_file)
+    #     else:
+    #         logger.error('Failed to download file for field %s', field)
 
     logger.warning('Done!')
 
-    'bytes=3803605-3866677'
 
 if __name__ == '__main__':
     main()
