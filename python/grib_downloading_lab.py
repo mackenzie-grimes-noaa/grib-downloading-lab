@@ -9,15 +9,14 @@
 #
 # Requirements:
 #   - [s5cmd](https://github.com/peak/s5cmd)
+#   - [idss-engine-commons library](https://github.com/NOAA-GSL/idss-engine-commons)
 #
 # Usage:
-#    python3 download_partial_grib.py \
-#        --product NBM \
+#    python3 grib_downloading_lab.py \
+#        --cleanup
 #        --issue_dt 2024-09-05T12:00:00Z \
 #        --valid_dt 2024-09-05T13:00:00Z \
-#        --fields RAIN1HR
 #
-#   Note that --fields should be one of the strings listed in the constants PRODUCT['field_lookup']
 #
 # ----------------------------------------------------------------------------------
 
@@ -25,7 +24,6 @@ from datetime import datetime
 import logging
 import os
 import sys
-# import re
 from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 
 from dateutil.parser import parse as dt_parse

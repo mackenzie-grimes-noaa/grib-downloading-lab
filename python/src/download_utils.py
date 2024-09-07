@@ -1,10 +1,18 @@
 """Some utilities for download grib research, copied from/based on DAS and idsse utilities"""
-
+# ------------------------------------------------------------------------------
+# Created on Thu Sept 5 2024
+#
+# Copyright (c) 2024 Colorado State University. All rights reserved. (1)
+#
+# Contributors:
+#     Mackenzie Grimes (1)
+#
+# ------------------------------------------------------------------------------
 import logging
 from datetime import datetime, timedelta, UTC
 from random import randint
 
-from idsse.common.utils import exec_cmd, to_iso, round_
+from idsse.common.utils import exec_cmd, to_iso
 
 logger = logging.getLogger(__name__)
 
