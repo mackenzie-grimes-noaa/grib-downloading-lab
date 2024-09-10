@@ -33,6 +33,7 @@ Optional command line arguments to change this behavior:
 - `--dest <str>`: path to the local directory where all GRIB files will be saved. Default: same directory as the script.
 - `--issue_dt <datetime>` and `--valid_dt <datetime>`: set a specific issue and valid datetime to download the GRIB file for (ISO-8601 format, e.g. 2020-01-01T12:00:00Z). By default, the issue and valid are randomly chosen on each download to ensure more evenly distributed performance and to side-step any AWS caching.
 - `--loglevel <str>`: the log level to use, e.g. "DEBUG". The default is "WARN"
+- `--iterations <int>`: the number of files to download and capture test data, per combination of s5cmd options. Default is 3.
 - `--product <str>`: some other weather model product. For now the only one supported is the default, "NBM"
 
 We had originally intended for this to experiment with download _partial_ GRIB files based on the weather fields one was interested in, and we added some logic to download individual fields from a GRIB file, since the AWS S3 API supports this by accepting a `Range` http header.

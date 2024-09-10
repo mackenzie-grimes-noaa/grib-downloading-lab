@@ -420,8 +420,9 @@ def test_concurrency(_args: Namespace):
         src_path, dest_path, file_size = _build_file_paths(reader, dest_dir, specific_issue,
                                                            specific_valid)
 
-    chunk_sizes = [1, 5, 10, 50]  # chunk size in MB
-    concurrency_threads = [5, 10, 20, 50, 200]
+    chunk_sizes = [1, 2, 3, 5, 10, 50]  # chunk size in MB
+    concurrency_threads = [8, 12, 16, 20]
+    iteration_count = _args.iterations
 
     files_created: list[str] = []  # local paths of any generated files, so we can cleanup later
 
@@ -429,17 +430,20 @@ def test_concurrency(_args: Namespace):
                 concurrency_threads, chunk_sizes)
     for concurrency in concurrency_threads:
         for chunk_size in chunk_sizes:
-            if not specific_issue or not specific_valid:
-                # pick a random issue_dt in the past few months, and a valid time +6 hours
-                issue, valid = get_random_issue_and_valid()
-                logger.debug('Generated random issue %s and valid %s', to_iso(issue), to_iso(valid))
-                src_path, dest_path, file_size = (
-                    _build_file_paths(reader, dest_dir, issue, valid)
-                )
+            for _ in range(0, iteration_count):
+                if not specific_issue or not specific_valid:
+                    # pick a random issue_dt in the past few months, and a valid time +6 hours
+                    issue, valid = get_random_issue_and_valid()
+                    logger.debug('Generated random issue %s and valid %s', to_iso(issue),
+                                 to_iso(valid))
+                    src_path, dest_path, file_size = (
+                        _build_file_paths(reader, dest_dir, issue, valid)
+                    )
 
-            file_created = _benchmark_aws_cp(src_path, dest_path, file_size,
-                                             s5_args=(concurrency, chunk_size))
-            files_created.append(file_created)
+                # run each combination of chunk_size and thread_count {iteration_count} times
+                file_created = _benchmark_aws_cp(src_path, dest_path, file_size,
+                                                s5_args=(concurrency, chunk_size))
+                files_created.append(file_created)
 
     # if requested, clean up copies of all files downloaded by this script
     if _args.cleanup and len(files_created) > 0:
@@ -483,6 +487,11 @@ def main():
                         dest='cleanup',
                         action=BooleanOptionalAction,
                         help='Pass this flag to have script delete all downloaded files when done')
+    parser.add_argument('--iterations',
+                        dest='iterations',
+                        default=3,
+                        type=int,
+                        help='Number of times to test each thread & chunk size combo in s5cmd')
     args = parser.parse_args()
 
     format_str = ('%(asctime)-15s %(levelname)-8s %(module)s::'
