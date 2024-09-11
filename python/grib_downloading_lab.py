@@ -420,7 +420,8 @@ def test_concurrency(_args: Namespace):
         src_path, dest_path, file_size = _build_file_paths(reader, dest_dir, specific_issue,
                                                            specific_valid)
 
-    chunk_sizes = [1, 2, 3, 5, 10, 50]  # chunk size in MB
+    # chunk_sizes = [1, 2, 3, 5, 10, 50]  # chunk size in MB
+    chunk_sizes = [1, 2, 3, 5, 10]
     concurrency_threads = [8, 12, 16, 20]
     iteration_count = _args.iterations
 
@@ -428,9 +429,9 @@ def test_concurrency(_args: Namespace):
 
     logger.info('Running s3 download for file concurrency threads: %s, chunk size %s MB',
                 concurrency_threads, chunk_sizes)
-    for concurrency in concurrency_threads:
-        for chunk_size in chunk_sizes:
-            for _ in range(0, iteration_count):
+    for _ in range(0, iteration_count):
+        for concurrency in concurrency_threads:
+            for chunk_size in chunk_sizes:
                 if not specific_issue or not specific_valid:
                     # pick a random issue_dt in the past few months, and a valid time +6 hours
                     issue, valid = get_random_issue_and_valid()
